@@ -31,7 +31,7 @@ Patch Minix3 system sources with
 
 # Build
 
-We need gmake to build kernel and user space code
+We need gmake to build kernel and user space code:
 ```{bash}
 # easypack make-3.80
 # ln /usr/bin/gmake /usr/gnu/bin/gmake
@@ -49,7 +49,7 @@ Now we can recompile the system (libraries, kernel and servers ) with
 # make install
 ```
 
-Upon sucessful compilation a kernel image should be generated under
+Upon sucessfull compilation a kernel image should be generated under
 /boot/image/3.1.1r1 the new *qnt*, a frontend for *quantum()* command should be available under /usr/bin/qnt.
 
 #Run
