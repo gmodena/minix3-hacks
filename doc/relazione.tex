@@ -1,0 +1,477 @@
+\documentclass[a4paper,12pt]{report}
+
+
+% Title Page
+\title{Scheduling in minix3}
+\author{Gabriele Modena, mat. 108742, gabriele.modena@gmail.com}
+
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\begin{abstract}
+Questo progetto mi ha portato ad approfondire il funzionamento dello
+scheduler di minix3 e la gestione delle syscall.
+In particolare, ho modificato la modalit\'a con cui i processi utente vengono
+consegnati al dispatcher, imponendo un criterio di selezione basato 
+sulla quantit\'a di tempo di cpu usato.
+Questo mi ha portato a implementare un meccanismo di inserimento nelle code
+di scheduling basato su priorit\'a.
+
+Parallelamente ho aggiunto una nuova system call, quantum(), che consente di
+cambiare (aumentare o diminuire) a run time la dimensione del quanto 
+temporale associata ad un processo.
+
+\end{abstract}
+
+\chapter{Funzionamento dello scheduler}
+\section{Introduzione}
+Lo scheduler di minix3 si basa su una struttura a code multilivello,
+16 nell'implementazione attuale, in cui i processi possono spostarsi dinamicamente 
+una coda all'altra (possono cio\'e modificare la loro priorit\'a).
+
+La natura a microkernel del sistema porta ad un distinguo tra quattro classi
+di processi (in ordine di priorit\'a):
+\begin{itemize}
+\item  \textbf{task}
+\item  \textbf{driver}
+\item  \textbf{server} (o \textit{servizi di sistema}) 
+\item  \textbf{user}.
+\end{itemize}
+
+Appartengono alla famiglia server i processi di sistema (gestione dei
+processi, log del sistema, is, file system...)  che vengono eseguiti in
+user space. I device driver (tty0, schede di rete etc.) fanno parte della
+categoria driver e vengono eseguiti con una priorit\'a maggiore rispetto ai
+server.
+I task SYSTEM, CLOCK e IDLE sono invece eseguiti in kernel space e
+costituiscono il cuore del sistema minix3.
+Tutto il resto rientra nella categoria user.
+\\
+La priorit\'a di un processo e determinata dalla coda in cui lo stesso viene posizionato:
+0 indicata la priorit\'a massima, 15 la minima.
+I \textit{task} CLOCK e SYSTEM vengono esegeuiti unicamente con priorit\'a
+0, IDLE occupa costantemente la coda 15 ed esegue quando non sono presenti
+processi ready.
+I processi \textit{di sistema} e i \textit{driver} si posizionano nelle code 0-6.
+I processi \textit{user} si vedono assegnata la coda 7, con la possibilit\'a di
+salire a 0 e scendere fino a 14.
+La tabella dei processi con le priorit\'a predefinite al boot del sistema 
+si puo\' trovare nel file \textit{kernel/table.c}.
+
+All'interno di ogni coda i processi sono gestiti tramite una versione modificata di \textbf{round robin}. 
+Ogni processo ha a disposizione un quanto temporale, durante il quale
+gli viene assegnata la cpu.
+Allo scadere del quanto temporale, il kernel effettua una preemption
+passando il controllo del processore ad un nuovo processo.
+
+I nuovi processi vengono accodati secondo uno schema FCFS.
+
+Il quanto varia in base al tipo di processo e rimane costante per tutta la durata
+di esecuzione, anche in caso di modifica della priorit\'a.
+
+Il server \textbf{clock} genera, ad intervalli regolari, degli impulsi hardware 
+che, tradotti messaggi software, vengono utilizzati per scandire il tempo di vita del processo
+in eseguzione. Vengono cio\'e incrementati il suo tempo di esecuzione (utente e di sistema)
+e viene decrementato il valore della variable \textbf{p\_ticks\_left}, che indica la porzione di quanto
+rimasta. Allo scadere del tempo, il sistema provvede ad eseguire un nuovo
+ciclo di scheduling.
+Un processo running pu\'o essere bloccato dal sistema (ad esempio per la
+notifica di un segnale). Nel momento in cui il processo diventa di nuovo
+ready, lo scheduler determina la sua posizione nella coda in base al quanto 
+temporale rimasto. Se il processo ha ancora tempo da spendere viene messo in
+testa alla coda, altrimenti in fondo. Parallelamente, il sistema verifica
+che il processo non sia entrato in un ciclo abbassando (incrementando
+p\_priority) la sua priorit\'a in caso affermativo o aumentandola (decrementando p\_priority) 
+nel caso in cui la sua esecuzione non abbia impedito ad altri processi di ottenere la cpu.
+
+Tipicamente ai processi task, driver e server \'e associato un quanto maggiore rispetto
+a quello dei processi utente ed \'e loro consetita l'esecuzione sequenziale fino al 
+termine dell'operazione. Nel caso in cui il tempo di esecuzione sia troppo
+alto, viene effettuata preemption per evitare cicli infiniti.
+
+\section{Struttura del codice}
+La parte di scheduling da me analizzata viene gestita interamente a livello kernel.
+I file interessati si trovano nella directory \textit{/usr/src/kernel}
+
+\subsection{glo.h}
+Questo header file contiene definizioni di variabli e strutture dati
+utilizzate globalmente nel codice del livello kernel.
+
+In particolare vengono dichiarati:
+\begin{itemize}
+\item \textbf{proc\_ptr} puntatore al processo attualmente in esecuzione.
+\item \textbf{next\_ptr} puntatore al prossimo processo che verr\'a eseguito
+\item \textbf{prev\_ptr} puntatore al processo eseguito in precedenza
+\item \textbf{bill\_ptr} puntatore al processo a cui si dovranno accreditare
+ticks di cpu.
+\end{itemize}
+
+\subsection{proc.h}
+In questo header si trovano le dichiarazioni della struttura \textbf{proc},
+che viene usata per rappresentare l'istanza di un processo in memoria.
+All'interno di proc vengono definite,  tra le altre:
+\begin{itemize}
+ \item il numero del processo, \textit{proc\_nr}, a livello kernel. Tale identificativo
+	non corrisponde al PID, che in minix3 \'e un'informazione fornita
+        dal server PM.
+ \item la priorit\'a attuale del processo, \textit{p\_priority}
+ \item la priorit\'a massima ottenibile dal processo, \textit{p\_max\_priority}
+ \item informazioni sulla natura del processo: utente (USR\_T), task o
+ (TSK\_T) server (SRV\_T), preemptive etc.)
+ \item tempo di vita, \textit{p\_user\_time} e \textit{p\_sys\_time}
+ \item dimensione del quanto e tempo rimasto \textit{p\_quantum\_size},
+ \textit{p\_ticks\_left}
+ \item nome del processo \textit{p\_name}
+\end{itemize}
+
+In proc.h sono definite anche le infromazioni relative alle code di scheduling:
+\begin{itemize}
+ \item numero di code presenti, \textit{NR\_SCHED\_QUEUES}
+ \item coda con la massima priorit\'a \textit{TASK\_Q}
+ \item coda predefinita per i processi utente \textit{USER\_Q}, massima
+ \textit{MAX\_USER\_Q} e minima \textit{MIN\_USER\_Q} coda raggiungibile 
+ \item coda con la minima priorit\'a, \textit{IDLE}. Tale coda \`e riservata
+ unicamente al task IDLE che viene eseguito quando nessun altro processo richiede la cpu. 
+\end{itemize}
+
+Una coda di priorit\'a \`e costituita da un'array di puntatori a strutture
+\textit{proc} indicizzate
+dai puntatori rdy\_head[Q] e rdy\_tail[Q] che rappresentano rispettivamente la cima e il fondo
+della coda Q.
+
+\subsection{proc.c}
+Questo file contiene le funzioni per la gestione dei processi.
+\begin{itemize}
+ \item \textit{sched()} detta la politica di scheduling per un processo. In particolare determina la coda (priorit\'a) da assegnare e la sua posizione nella stessa (capo o fondo).
+ \item \textit{enqueue()} inserisce un processo in una coda
+ \item \textit{dequeue()} rimuove un processo da una coda
+ \item \textit{pick\_proc()} svolge la funzione di dispatcher. Un ciclo
+ scorre tutte le code assegnando la cpu al primo processo pronto ad
+ eseguire, posizionato in testa (rdy\_head) alla prima coda non vuota
+ trovata. Una volta trovato un processo utile, pick\_proc() aggiorna i
+ riferimenti di next\_ptr e bill\_ptr. Se non ci sono processi pronti ad
+ eseguire, il controllo della cpu passa al task IDLE (coda 15).
+\end{itemize}
+
+\subsection{clock.c}
+Questo file contiene il codice relativo al task CLOCK.
+CLOCK si occupa, tra l'altro, di aggiornare il tempo di esecuzione, in
+ticks, del processo (p\_user\_time) e la porzione di quanto rimasta 
+(p\_ticks\_left).
+Se il processo ha la flag BILLABLE attiva, come tipicamente avviene per i
+processi utente, il sistema provvede a far pagare un costo aggiuntivo
+di tempo di sistema (p\_sys\_time) per compensare l'overhead dovuto allo scheduling.
+
+\chapter{Modifica dello scheduler}
+\section{Politica}
+Lo scopo del mio lavoro \'e stato modificare lo scheduler per fare in modo che, 
+nel momento in cui nessun task o server sia pronto ad eseguire, il sistema selezioni
+il processo utente che recentemente ha usato la cpu per meno tempo.
+\'E stato necessario implementare un meccanismo di invecchiamento dei
+processi in coda per evitare starvation.
+
+\section{Meccanismo}
+La struttura a code multilivello \'e stata modificata, isolando i processi
+utente nella sola coda 7 (USER\_Q).
+
+In \textit{kernel/glo.h} ho dichiarato due nuovi array con lo scopo di tenere
+traccia del tempo di esecuzione del processo e di fornire un indice dinamico
+di priorit\'a:
+\begin{center}
+        prio\_estimate[NR\_PROCS] e procs\_lifetime[NR\_PROCS];
+\end{center}
+
+L'etichetta \textit{NR\_PROCS}, definita in \textit{minix/com.h}, indica il numero 
+massimo di processi utente consentiti dal sistema.
+
+Questi due array vengono inizializzati al boot del sistema (\textit{kernel/main.c} ) e alla creazione
+di un nuovo processo tramite fork(\textit{kernel/system/do\_fork.c}).
+
+\textit{procs\_lifetime} svolge il ruolo di cronometro: 
+ad ogni interrupt viene incrementato il valore nella posizione associata al processo
+attualmente in esecuzione (equivale a calcolare lo user time). 
+Al momento di inserire un nuovo processo in coda, si aggiorna la stima di
+priorit\'a
+sommando il tempo di vita del processo e si verifica che sia trascorso un 
+tempo minimo di attesa. In caso affermativo
+il cronometro viene azzerato e le stime di priorit\'a definite da
+prio\_estimate decrementate.
+Questo evita che un processo abbia un tempo di vita tendente a infinito e rimanga
+bloccato in coda.
+
+A questo punto, il processo viene inserito nella coda utente rispettando
+l'ordinamento (crescente) basato sulla priorit\'a. Un processo con valore
+pi\'u basso ha eseguito per meno tempo e si vede associata una priorit\'a
+pi\'u alta.
+
+Il codice che gestisce questo meccanismo \'e contenuto in:
+
+\begin{itemize}
+\item \textbf{kernel/clock.c} - \textit{clock\_handler()}: il task CLOCK
+incrementa il cronometro.
+\item \textbf{kernel/proc.c} - \textit{enqueue()}: gestisce l'inserimento del
+processo in coda in base alla politica di scheduling opportuna. Si vedano i
+commenti al codice per effettuare un test sulla starvation dei processi.
+\end{itemize}
+
+\section{Visualizzazione}
+Premendo il tasto F9 viene effettuato un dump delle
+code di scheduling e di prio\_estimate sul terminale tty0.
+Alla pressione del tasto, il server is (information server) esegue la
+funzione \textit{sched\_dmp()} definita in \textit{is/dmp\_kernel.c}
+Come tutte le funzioni implementate in questo file, \textit{sched\_dmp()}
+esegue il dump di strutture dati definite in kernel space stampando l'output
+su terminale.
+
+Per poter accedere a prio\_estimate \'e stato necessario intervenire 
+sulla system call do\_getinfo del task SYSTEM e sugli header della libreria di sistema
+ad essa associata.
+In particolare:
+\begin{itemize}
+\item aggiungere l'etichetta \textit{SYS\_PRIOINFO} all'header \textit{minix/com.h}
+\item aggiungere la macro \textit{do\_priogetinfo} all'header \textit{minix/syslib.h}. Questa
+macro fa da wrapper alla funzione di libreria sys\_getinfo, richiamandola
+con il segnale opportuno
+\item modificare \textit{system/do\_getinfo()} per gestire il segnale e inviare una
+copia di prio\_estimate in user space.
+\item modificare la funzione \textit{dmp\_sched()}.
+\end{itemize}
+
+Si vedano i commenti al codice per i dettagli sul funzionamento di
+do\_getinfo.
+
+In seguito alle modifiche, is \'e in grado di visualizzare, per ogni
+processo in coda 7, nome, numero e priorit\'a.
+
+\section{Considerazioni}
+Inzialmente era mia intenzione usare un timer per notificare
+SYSTEM e CLOCK dello scadere dell'intervallo di tempo.
+L'uso dei timer \'e per\'o risultato in sporadiche corruzioni degli array,
+in situazioni che non sono riuscito a riprodurre.
+Questa situazione mi ha portato a cercare una soluzione alternativa, meno
+elegante ma che dai test che ho effettuato si \'e rivelata pi\'u robusta.
+Ho adottato un meccanismo analogo a quello usato dal task CLOCK per
+decretare la preemption del processo che sta usando la cpu.
+Parallelamente all'incremento di procs\_lifetime, decremento un contatore
+time\_elapsed. Nella funzione enqueue(), al momento di stimare la priorit\'a
+del processo entrante verifico lo stato di time\_elapsed. Se il contatore
+\'e arrivato a zero o meno, faccio ripartire il cronometro azzerando
+procs\_lifetime di tutti i processi e riduco le loro priorit\'a di
+$\frac{1}{4}$.
+L'uso di due array con informazioni ridondanti si e\' reso necessario
+perch\'e lavorare direttamente su procs\_lifetime ha portato a delle
+incongruenze nel calcolo priorit\'a. Dati i ridottissimi tempi di
+esecuzione, capitava che al momento di inserire in coda un nuovo processo
+non fosse pi\'u quello da me atteso.
+
+Per verificare il funzionamento delle modifiche ho usato la suite di  test
+presente in \textit{/usr/src/test}.
+Per stressare il sistema ho eseguito due test in parallelo, con il risultato
+di far fallire test5 (file buffer overflow), mandandolo in un ciclo di
+durata indefinita . Questo esperimento ha rivelato che il cambio dinamico di
+priorit\'a ha permesso di evitare il blocco del processo in coda con
+conseguente starvation.
+
+
+\chapter{Struttura delle system call}
+\section{syscall in minix3}
+L'interazione tra i processi utente, server e kernel (e i driver) avviene 
+tramite scambio di messaggi.
+In un sistema monolitico, il termine \textit{system call} si riferisce a
+tutte le funzioni che consentono di accedere a servizi forniti dal kernel.
+
+In minix3 le chiamate di processi utente vengono trasformate in messaggi a
+processi server, che a loro volta comunicano tra loro e con i driver e il
+kernel sempre tramite messaggi.
+
+Il sistema prevede un insieme di chiamate a livello kernel implementate dal
+task SYSTEM (kernel/system). Per ognuna di queste chiamate, esiste un
+corrispettivo in user space implementato nella libreria \textit{syslib}
+(minix/com.h, minix/syslib.h e /usr/src/lib/syslib) e accessibile dai
+processi server.
+Ad ogni chiamata e\' associato un id in forma SYS\_CALLNAME 
+e il kernel, al boot, crea una tabelle di associazioni
+(\textit{kernel/system.c}) tra funzioni di libreria e 
+chiamate kernel.
+Queste funzioni non possono essere richiamate da utente e prendono il nome
+di \textit{kernel calls}.
+
+Ad un livello superiore si trovano le chiamate relative ai servizi di
+sistema e le chiamate POSIX, che si appogiano ai due strati sottostanti.
+Queste funzioni formano l'insieme delle \textit{system call} fornite all'utente.
+
+In generale, una chiamata ad una system call in minix3 risulta nella
+chiamata al suo analogo in kernel space.
+
+\section{Aggiunta di una nuova system call: quantum()}
+
+La seconda parte del progetto e\' stata aggiungere il comando qnt che
+consente di modificare la dimensione del quanto temporale di un processo.
+
+I passi necessari sono stati:
+\begin{itemize}
+\item Aggiungere la funzione \textit{sys\_quantum()} alla libreria di sistema
+(\textit{syslib} ) e
+modificare il vettore delle chiamate affinch\'e la richiesta sia inviata
+correttamente al task SYSTEM. Questa funzione non viene richiamata
+direttamente dall'utente, ma dal server PM (\textit{Process Manager}).
+\item Aggiungere la kernel call \textit{do\_quantum()} che, una volta ricevuto
+un messaggio da \textit{sys\_quantum()} modifichi opportunamente le strutture
+dati dei processi. Possiamo vedere questa procedura come l'implementazione in
+kernel space di \textit{sys\_quantum()}.
+\item Aggiungere la system call \textit{quantum()}, che invia un messaggio con la
+richiesta \textit{QUANTUM} al server PM. Quest'ultimo, associa la chiamata alla
+funzione do\_quantum() che a sua volta richiama \textit{sys\_quantum()} con i
+parametri opportuni.
+
+\item Scrivere un comando \texbf{qnt} che richiama la funzione
+\textit{quantum()} prendendo in input pid del processo da modificare e
+dimensione del quanto. \textit{qnt} \'e stato aggiunto ai comandi di sistema
+presenti in \textit{/usr/src/commands/simple} e viene installato in
+\textit{/usr/bin}.
+\end{itemize}
+
+\section{Modifiche agli header}
+Per implementare la chiamata \'e stato necessario effettuare delle modifiche
+agli header presenti in \textit{/usr/include/minix}.
+
+\subsection{minix/com.h}
+Qui sono definite delle etichette usate globalmente da varie parti del
+sistema.
+Le modifiche apportate sono:
+\begin{itemize}
+\item definita \textit{PR\_QUANTUM}: fa da alias al campo m1\_i2 (int) della
+struttura dati usata per inviare messaggi tra processi. Rappresenta la
+dimensione del quanto.
+\item definite \textit{MAX\_QUANTUM\_SIZE} e \textit{MIN\_QUANTUM\_SIZE}:
+dimensione massima e minima (in ticks) assegnabile al quanto.
+\item aggiunta una kernel call \textit{SYS\_QUANTUM} e incrementato il
+valore di \textit{NR\_SYS\_CALL}.
+\end{itemize}
+
+\subsection{minix/callnr.h}
+Questo file contiene una lista di system call 
+richiamabili da utente.
+Ho aggiunto la chiamata numero 91, \textit{QUANTUM}, e incrementato il
+numero di \textit{NR\_CALLS}
+
+\subsection{minix/syslib.h}
+Dichiarato il prototipo della funzione \textit{sys\_quantum()}
+
+\section{do\_quantum()}
+\'E la kernel call vera e propria, dichiarata in \textit{kernel/system.h}.
+
+Viene eseguita a livello kernel e pertanto ha accesso diretto a tutte le
+strutture dati presenti in memoria. In particolare, puo\'o modificare 
+i singoli elementi presenti nella tabella dei processi.
+
+Come detto prima, in minix3 le system call sono implementate via message
+passing.
+
+do\_quantum() riceve da sys\_quantum() e procede ad estrarre i campi
+PR\_PROC\_NUM (numero del processo in kernel space) e PR\_QUANTUM.
+
+A questo punto vengono effettuati dei test sulla validit\'a del numero di
+processo, in particolare viene verificato che il processo selezionato sia in
+user space (non task).
+
+Quindi viene verificato che la dimensione del quanto rispetti i limiti imposti a
+compile time, in caso contrario il valore viene ridimensionato e la funzione
+stampa un messaggio di errore su tty0.
+
+A questo punto il processo da modificare viene selezionato grazie alla macro
+\textit{proc\_addr()} (\textit{kernel/proc.c}).
+Una volta rimosso dalla coda, il campo \textit{p\_quantum\_size} viene modificato, e
+il processo reinserito in coda.
+
+In ultimo, ho aggiunto la label \textit{USE\_QUANTUM} all'header
+\textit{kernel/config.h} in modo da poter decidere o meno l'inclusione delle
+chiamata a compile time.
+
+\section{sys\_quantum()}
+\begin{verbatim}
+int sys_quantum(int proc, int qnt)
+\end{verbatim}
+
+La funzione di libreria \'e implementata in
+\textit{/usr/src/lib/syslib/sys\_quantum.c} ed \'e richiamabile in user
+space.
+
+Il suo scopo e\' di creare un mesaggio contente i campi PR\_PROC\_NUM 
+e PR\_QUANTUM impostati, con i valori proc e qnt passati, e
+inviarlo al task SYSTEM tramite la funzione \textit{\_taskcall()}
+(\textit{/usr/src/lib/sysutil/}) notificando la richiesta di esecuzione
+della chiamata \textit{SYS\_QUANTUM}. 
+
+Il task SYSTEM mantiene un vettore delle chiamate (\textit{calls vector}),
+inzializzato a boot time dalla funzione \textit{initialize}
+(\textit{kernel/system.c}).
+Lo scopo di tale vettore \'e associare le chiamate  dichiarate in
+(\textit{minix/com.h}) alla loro implementazione in kernel space.
+Ad esempio, la chiamata \textit{SYS\_QUANTUM} viene associata alla funzione
+\textit{do\_quantum()} tramite:
+\begin{verbatim}
+map(SYS_QUANTUM, do_quantum)
+\end{verbatim}
+
+\section{quantum()}
+La struttura a livelli di minix3 non consente ad un processo di dialogare
+direttamente con il task SYSTEM (kernel space).
+In particolare, la gestione dei processi \'e demanata al servizio PM.
+
+Per poter accedere alla funzione sys\_quantum \'e stato necessario
+modificare tale servizio aggiungendo una nuova system call: \textit{QUANTUM}
+(91).
+
+L'implementazione della system call si trova nel file
+\textit{/usr/src/lib/other/quantum.c} e la sua dichiarazione nell'header
+\textit{sys/resources.h}:
+\begin{verbatim}
+int quantum(int pid, int qnt)
+\end{verbatim}
+
+La funzione prende in input il PID del processo da modificare e la dimensione del quanto,
+crea un messaggio aggiornando i campi opportuni e lo invia al
+server PM notificando la system call QUANTUM.
+
+A questo punto, \'e stato necessario modificare il server PM aggiungendo la
+nuova system call al \textit{call\_vector} (\textit{table.c}) e associandola
+alla funzione \texit{do\_quantum()}.
+
+Questa funzione \'e implementata nel file \textit{misc.c}.
+
+Una volta ricevuto un messaggio da un processo utente, verifica che l'utente
+che ha effettuato la richiesta sia \textbf{root}, estrae il campo PR\_PID
+e PR\_QUANTUM, converte il pid selezionato nel corrispettivo numero di
+processo a livello kernel e invoca sys\_quantum() con i parametri opportuni.
+
+A questo punto, viene stampato un messaggio di debug su tty0 che riporta il
+numero del processo modificato.
+
+\chapter{Approccio e metodo di lavoro}
+Ho dedicato la prima settimana di lavoro allo studio della documentazione
+sul funzionamento del sistema e ha prendere confidenza con gli strumenti.
+
+Per prima ho affrontato la parte sullo scheduler, qui ho avuto alcuni
+problemi dovuti alla difficolt\'a nel fare debug. 
+
+Per aiutarmi in questo senso sono ricorso all'inserimento di kprintf nel
+codice, un metodo rozzo ma utile in mancanza di un debugger in kernel space.
+Di fondamentale importanza \'e stato il servizio IS, che consente di avere
+una vista immediata e in tempo reale su tutte le strutture dati del kernel.
+
+In particolare, al posto degli array prio\_estimate e procs\_lifetime avevo 
+modificato la struttura \textbf{proc} per tenere traccia delle informazioni. 
+Questo, solo in alcuni casi non sempre riproducibili, \'e risultato in immagini 
+corrotte.
+Le difficolt\'a nel tracciare questo tipo di errori mi hanno fatto preferire
+una soluzione basata sugli array esterni, lo spreco di memoria \'e maggiore
+ma la comodit\'a nella gestione e nel debug \'e sensibilmente aumentata.
+
+Per quanto riguarda l'aggiunta della system call quantum(), ho analizzato il
+funzionamento del comando nice e da li ho individuato le porzioni di codice su
+cui intervenire per ottenere il risultato desiderato.
+
+\end{document}          
