@@ -1,5 +1,5 @@
 Implementation of a priority queue scheduler for minix3 and a syscall, *quantum()*,
-that allows to increment/decrease a process time quantum  at run time.
+that allows to increment/decrement a process time quantum  at run time.
 
 It's an old toy project that I hacked together during my BSc (~2006), but it still does its job. Kernel space is fun.
 
